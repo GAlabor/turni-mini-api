@@ -1,6 +1,8 @@
 // mini-auth.js — micro server per rinnovo token Google
 import express from "express";
 import fetch from "node-fetch";
+import cors from "cors";
+
 
 // ======================
 // FIREBASE ADMIN / FIRESTORE
@@ -17,7 +19,16 @@ const db = getFirestore();
 // EXPRESS
 // ======================
 const app = express();
+
+// CORS aperto per ora (lo stringiamo dopo)
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST"],
+  allowedHeaders: ["Content-Type"]
+}));
+
 app.use(express.json());
+
 
 // ======================
 // CONFIGURAZIONE BASE
