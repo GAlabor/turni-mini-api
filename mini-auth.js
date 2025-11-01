@@ -85,10 +85,15 @@ app.get("/firestore-test", async (_, res) => {
   }
 });
 
+
+
+
 // Riceve il code da OAuth e scambia per token + refresh
-app.post("/oauth2/callback", async (req, res) => {
-  const { code } = req.body;
-  if (!code) return res.status(400).json({ error: "Missing code" });
+async function handleOAuthCallback(req, res, forcedCode) {
+  const code = forcedCode || (req.body && req.body.code);
+  if (!code) {
+    return res.status(400).json({ error: "Missing code" });
+  }
 
   try {
     const resp = await fetch("https://oauth2.googleapis.com/token", {
@@ -114,7 +119,6 @@ app.post("/oauth2/callback", async (req, res) => {
       try {
         await saveRefreshToFirestore(data.refresh_token);
       } catch (err) {
-        // non blocchiamo la risposta al client se il salvataggio fallisce
         console.error("Errore salvataggio refresh su Firestore:", err.message);
       }
     } else {
@@ -125,16 +129,31 @@ app.post("/oauth2/callback", async (req, res) => {
       }
     }
 
-    res.json({
+    return res.json({
       access_token: data.access_token,
       expires_in: data.expires_in,
       has_refresh: !!(data.refresh_token || REFRESH_TOKEN)
     });
   } catch (err) {
     console.error("Exchange failed:", err);
-    res.status(500).json({ error: "Exchange failed", detail: err.message });
+    return res.status(500).json({ error: "Exchange failed", detail: err.message });
   }
+}
+
+// versione GET: è quella che userà Google dopo il redirect
+app.get("/oauth2/callback", async (req, res) => {
+  const { code } = req.query;
+  await handleOAuthCallback(req, res, code);
 });
+
+// versione POST: è quella che possiamo chiamare noi dal frontend
+app.post("/oauth2/callback", async (req, res) => {
+  await handleOAuthCallback(req, res, null);
+});
+
+
+
+
 
 // Rinnova il token usando il refresh salvato
 app.post("/oauth2/refresh", async (req, res) => {
