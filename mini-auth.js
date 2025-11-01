@@ -1,7 +1,6 @@
-// mini-auth.js — micro server per rinnovo token Google
+// mini-auth.js — micro server per rinnovo token Google + Firestore
 import express from "express";
 import fetch from "node-fetch";
-import cors from "cors";
 
 // ======================
 // FIREBASE ADMIN / FIRESTORE
@@ -15,6 +14,23 @@ initializeApp({ credential: cert(creds) });
 const db = getFirestore();
 
 // ======================
+// EXPRESS
+// ======================
+const app = express();
+app.use(express.json());
+
+// CORS molto permissivo per il tuo frontend
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+  next();
+});
+
+// ======================
 // CONFIGURAZIONE BASE
 // ======================
 const GOOGLE_CLIENT_ID     = process.env.GOOGLE_CLIENT_ID;
@@ -24,20 +40,9 @@ const GOOGLE_REDIRECT_URI  = process.env.GOOGLE_REDIRECT_URI;
 // in RAM (veloce) — ma adesso abbiamo anche Firestore
 let REFRESH_TOKEN = null;
 
-// nome/coll/doc che useremo in Firestore (condiviso)
+// nome/coll/doc che useremo in Firestore
 const FS_COLLECTION = "auth";
 const FS_DOC        = "google";
-
-// ======================
-// EXPRESS
-// ======================
-const app = express();
-app.use(cors({
-  origin: "*",
-  methods: ["GET","POST","OPTIONS"],
-  allowedHeaders: ["Content-Type"]
-}));
-app.use(express.json());
 
 // ======================
 // FUNZIONI DI SUPPORTO
@@ -59,20 +64,21 @@ async function loadRefreshFromFirestore() {
   return data.refresh_token || null;
 }
 
-// PRE-CARICO: al boot prova già a prenderselo
-(async () => {
+// al boot proviamo a caricare il refresh in RAM
+async function preloadRefresh() {
   try {
-    const tok = await loadRefreshFromFirestore();
-    if (tok) {
-      REFRESH_TOKEN = tok;
-      console.log("[BOOT] Refresh pre-caricato da Firestore.");
+    const rt = await loadRefreshFromFirestore();
+    if (rt) {
+      REFRESH_TOKEN = rt;
+      console.log("Refresh token precaricato da Firestore.");
     } else {
-      console.log("[BOOT] Nessun refresh in Firestore (ancora).");
+      console.log("Nessun refresh token ancora in Firestore.");
     }
   } catch (err) {
-    console.error("[BOOT] Errore preload refresh:", err.message);
+    console.error("Errore preload refresh:", err.message);
   }
-})();
+}
+preloadRefresh();
 
 // ======================
 // ENDPOINTS
@@ -115,7 +121,6 @@ app.post("/oauth2/callback", async (req, res) => {
 
     const data = await resp.json();
     if (data.error) {
-      console.error("[CALLBACK] Errore Google:", data);
       return res.status(400).json(data);
     }
 
@@ -124,16 +129,14 @@ app.post("/oauth2/callback", async (req, res) => {
       REFRESH_TOKEN = data.refresh_token;
       try {
         await saveRefreshToFirestore(data.refresh_token);
-        console.log("[CALLBACK] Refresh salvato su Firestore.");
       } catch (err) {
-        console.error("[CALLBACK] Errore salvataggio refresh su Firestore:", err.message);
+        console.error("Errore salvataggio refresh su Firestore:", err.message);
       }
     } else {
       // se non dà il refresh, proviamo a caricarne uno da Firestore (magari già c'è)
       const fromFs = await loadRefreshFromFirestore();
       if (fromFs) {
         REFRESH_TOKEN = fromFs;
-        console.log("[CALLBACK] Nessun refresh da Google, usato quello da Firestore.");
       }
     }
 
@@ -148,23 +151,15 @@ app.post("/oauth2/callback", async (req, res) => {
   }
 });
 
-// Rinnova il token usando il refresh salvato
+// Rinnova il token usando il refresh salvato (POST)
 app.post("/oauth2/refresh", async (req, res) => {
   try {
-    // 1) prima proviamo RAM
     let refresh = REFRESH_TOKEN;
-
-    // 2) se non c'è in RAM, proviamo Firestore
     if (!refresh) {
       refresh = await loadRefreshFromFirestore();
-      if (refresh) {
-        REFRESH_TOKEN = refresh; // ricarichiamo in RAM per le prossime volte
-        console.log("[REFRESH] Ricaricato da Firestore al volo.");
-      }
+      if (refresh) REFRESH_TOKEN = refresh;
     }
-
     if (!refresh) {
-      console.warn("[REFRESH] chiamato ma nessun refresh token trovato.");
       return res.status(400).json({ error: "No refresh token yet" });
     }
 
@@ -181,18 +176,16 @@ app.post("/oauth2/refresh", async (req, res) => {
 
     const data = await resp.json();
     if (data.error) {
-      console.error("[REFRESH] Errore Google:", data);
       return res.status(400).json(data);
     }
 
-    // se Google ci restituisce di nuovo un refresh (raro), lo aggiorniamo
+    // se Google ci restituisce di nuovo un refresh (raro), aggiorniamo
     if (data.refresh_token) {
       REFRESH_TOKEN = data.refresh_token;
       try {
         await saveRefreshToFirestore(data.refresh_token);
-        console.log("[REFRESH] Refresh aggiornato su Firestore.");
       } catch (err) {
-        console.error("[REFRESH] Errore aggiornamento refresh su Firestore:", err.message);
+        console.error("Errore aggiornamento refresh su Firestore:", err.message);
       }
     }
 
@@ -202,6 +195,44 @@ app.post("/oauth2/refresh", async (req, res) => {
     });
   } catch (err) {
     console.error("Refresh failed:", err);
+    res.status(500).json({ error: "Refresh failed", detail: err.message });
+  }
+});
+
+// Rinnova il token usando il refresh salvato (GET) per test da browser
+app.get("/oauth2/refresh", async (req, res) => {
+  try {
+    let refresh = REFRESH_TOKEN;
+    if (!refresh) {
+      refresh = await loadRefreshFromFirestore();
+      if (refresh) REFRESH_TOKEN = refresh;
+    }
+    if (!refresh) {
+      return res.status(400).json({ error: "No refresh token yet" });
+    }
+
+    const resp = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+        refresh_token: refresh,
+        grant_type: "refresh_token"
+      })
+    });
+
+    const data = await resp.json();
+    if (data.error) {
+      return res.status(400).json(data);
+    }
+
+    res.json({
+      access_token: data.access_token,
+      expires_in: data.expires_in
+    });
+  } catch (err) {
+    console.error("Refresh failed (GET):", err);
     res.status(500).json({ error: "Refresh failed", detail: err.message });
   }
 });
