@@ -3,7 +3,6 @@ import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
 
-
 // ======================
 // FIREBASE ADMIN / FIRESTORE
 // ======================
@@ -16,21 +15,6 @@ initializeApp({ credential: cert(creds) });
 const db = getFirestore();
 
 // ======================
-// EXPRESS
-// ======================
-const app = express();
-
-// CORS aperto per ora (lo stringiamo dopo)
-app.use(cors({
-  origin: "*",
-  methods: ["GET", "POST"],
-  allowedHeaders: ["Content-Type"]
-}));
-
-app.use(express.json());
-
-
-// ======================
 // CONFIGURAZIONE BASE
 // ======================
 const GOOGLE_CLIENT_ID     = process.env.GOOGLE_CLIENT_ID;
@@ -40,9 +24,20 @@ const GOOGLE_REDIRECT_URI  = process.env.GOOGLE_REDIRECT_URI;
 // in RAM (veloce) — ma adesso abbiamo anche Firestore
 let REFRESH_TOKEN = null;
 
-// nome/coll/doc che useremo in Firestore
+// nome/coll/doc che useremo in Firestore (condiviso)
 const FS_COLLECTION = "auth";
 const FS_DOC        = "google";
+
+// ======================
+// EXPRESS
+// ======================
+const app = express();
+app.use(cors({
+  origin: "*",
+  methods: ["GET","POST","OPTIONS"],
+  allowedHeaders: ["Content-Type"]
+}));
+app.use(express.json());
 
 // ======================
 // FUNZIONI DI SUPPORTO
@@ -63,6 +58,21 @@ async function loadRefreshFromFirestore() {
   const data = snap.data();
   return data.refresh_token || null;
 }
+
+// PRE-CARICO: al boot prova già a prenderselo
+(async () => {
+  try {
+    const tok = await loadRefreshFromFirestore();
+    if (tok) {
+      REFRESH_TOKEN = tok;
+      console.log("[BOOT] Refresh pre-caricato da Firestore.");
+    } else {
+      console.log("[BOOT] Nessun refresh in Firestore (ancora).");
+    }
+  } catch (err) {
+    console.error("[BOOT] Errore preload refresh:", err.message);
+  }
+})();
 
 // ======================
 // ENDPOINTS
@@ -85,15 +95,10 @@ app.get("/firestore-test", async (_, res) => {
   }
 });
 
-
-
-
 // Riceve il code da OAuth e scambia per token + refresh
-async function handleOAuthCallback(req, res, forcedCode) {
-  const code = forcedCode || (req.body && req.body.code);
-  if (!code) {
-    return res.status(400).json({ error: "Missing code" });
-  }
+app.post("/oauth2/callback", async (req, res) => {
+  const { code } = req.body;
+  if (!code) return res.status(400).json({ error: "Missing code" });
 
   try {
     const resp = await fetch("https://oauth2.googleapis.com/token", {
@@ -110,6 +115,7 @@ async function handleOAuthCallback(req, res, forcedCode) {
 
     const data = await resp.json();
     if (data.error) {
+      console.error("[CALLBACK] Errore Google:", data);
       return res.status(400).json(data);
     }
 
@@ -118,42 +124,29 @@ async function handleOAuthCallback(req, res, forcedCode) {
       REFRESH_TOKEN = data.refresh_token;
       try {
         await saveRefreshToFirestore(data.refresh_token);
+        console.log("[CALLBACK] Refresh salvato su Firestore.");
       } catch (err) {
-        console.error("Errore salvataggio refresh su Firestore:", err.message);
+        console.error("[CALLBACK] Errore salvataggio refresh su Firestore:", err.message);
       }
     } else {
       // se non dà il refresh, proviamo a caricarne uno da Firestore (magari già c'è)
       const fromFs = await loadRefreshFromFirestore();
       if (fromFs) {
         REFRESH_TOKEN = fromFs;
+        console.log("[CALLBACK] Nessun refresh da Google, usato quello da Firestore.");
       }
     }
 
-    return res.json({
+    res.json({
       access_token: data.access_token,
       expires_in: data.expires_in,
       has_refresh: !!(data.refresh_token || REFRESH_TOKEN)
     });
   } catch (err) {
     console.error("Exchange failed:", err);
-    return res.status(500).json({ error: "Exchange failed", detail: err.message });
+    res.status(500).json({ error: "Exchange failed", detail: err.message });
   }
-}
-
-// versione GET: è quella che userà Google dopo il redirect
-app.get("/oauth2/callback", async (req, res) => {
-  const { code } = req.query;
-  await handleOAuthCallback(req, res, code);
 });
-
-// versione POST: è quella che possiamo chiamare noi dal frontend
-app.post("/oauth2/callback", async (req, res) => {
-  await handleOAuthCallback(req, res, null);
-});
-
-
-
-
 
 // Rinnova il token usando il refresh salvato
 app.post("/oauth2/refresh", async (req, res) => {
@@ -166,10 +159,12 @@ app.post("/oauth2/refresh", async (req, res) => {
       refresh = await loadRefreshFromFirestore();
       if (refresh) {
         REFRESH_TOKEN = refresh; // ricarichiamo in RAM per le prossime volte
+        console.log("[REFRESH] Ricaricato da Firestore al volo.");
       }
     }
 
     if (!refresh) {
+      console.warn("[REFRESH] chiamato ma nessun refresh token trovato.");
       return res.status(400).json({ error: "No refresh token yet" });
     }
 
@@ -186,16 +181,18 @@ app.post("/oauth2/refresh", async (req, res) => {
 
     const data = await resp.json();
     if (data.error) {
+      console.error("[REFRESH] Errore Google:", data);
       return res.status(400).json(data);
     }
 
-    // se Google ci restituisce di nuovo un refresh (raro ma possibile), lo aggiorniamo
+    // se Google ci restituisce di nuovo un refresh (raro), lo aggiorniamo
     if (data.refresh_token) {
       REFRESH_TOKEN = data.refresh_token;
       try {
         await saveRefreshToFirestore(data.refresh_token);
+        console.log("[REFRESH] Refresh aggiornato su Firestore.");
       } catch (err) {
-        console.error("Errore aggiornamento refresh su Firestore:", err.message);
+        console.error("[REFRESH] Errore aggiornamento refresh su Firestore:", err.message);
       }
     }
 
@@ -212,5 +209,3 @@ app.post("/oauth2/refresh", async (req, res) => {
 // avvio server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Mini-API pronta su ${PORT}`));
-
-
