@@ -1,4 +1,4 @@
-// mini-auth.js — micro server per rinnovo token Google + Firestore
+// mini-auth.js — micro server per rinnovo token Google (VERSIONE PER-UTENTE)
 import express from "express";
 import fetch from "node-fetch";
 
@@ -14,26 +14,16 @@ initializeApp({ credential: cert(creds) });
 const db = getFirestore();
 
 // ======================
-// CONFIGURAZIONE BASE
-// ======================
-const GOOGLE_CLIENT_ID     = process.env.GOOGLE_CLIENT_ID;
-const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
-const GOOGLE_REDIRECT_URI  = process.env.GOOGLE_REDIRECT_URI;
-
-const FS_COLLECTION = "auth";
-const FS_DOC        = "google";
-
-// ======================
 // EXPRESS
 // ======================
 const app = express();
 app.use(express.json());
 
-// CORS base per le chiamate dal browser
+// CORS apertissimo per la tua PWA
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") {
     return res.sendStatus(204);
   }
@@ -41,24 +31,61 @@ app.use((req, res, next) => {
 });
 
 // ======================
+// CONFIGURAZIONE BASE
+// ======================
+const GOOGLE_CLIENT_ID     = process.env.GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+const GOOGLE_REDIRECT_URI  = process.env.GOOGLE_REDIRECT_URI;
+
+// RAM di cortesia: mappa email -> refresh
+const RAM_REFRESH = new Map();
+
+// nome collection che useremo in Firestore
+const FS_COLLECTION = "auth";
+
+// ======================
 // FUNZIONI DI SUPPORTO
 // ======================
-async function saveRefreshToFirestore(refreshToken) {
-  await db.collection(FS_COLLECTION).doc(FS_DOC).set({
+
+// salva il refresh token per UNA specifica email
+async function saveRefreshForUser(email, refreshToken) {
+  await db.collection(FS_COLLECTION).doc(email).set({
     refresh_token: refreshToken,
     updated_at: new Date().toISOString()
   });
+  RAM_REFRESH.set(email, refreshToken);
 }
 
-async function loadRefreshFromFirestore() {
-  const snap = await db.collection(FS_COLLECTION).doc(FS_DOC).get();
+// legge il refresh token per UNA specifica email
+async function loadRefreshForUser(email) {
+  // prima provo RAM
+  if (RAM_REFRESH.has(email)) {
+    return RAM_REFRESH.get(email);
+  }
+  // poi Firestore
+  const snap = await db.collection(FS_COLLECTION).doc(email).get();
   if (!snap.exists) return null;
   const data = snap.data();
-  return data.refresh_token || null;
+  const rt = data.refresh_token || null;
+  if (rt) {
+    RAM_REFRESH.set(email, rt);
+  }
+  return rt;
 }
 
-// in RAM
-let REFRESH_TOKEN = null;
+// prova a ricavare la mail usando l'access_token
+async function fetchUserEmail(accessToken) {
+  const resp = await fetch("https://openidconnect.googleapis.com/v1/userinfo", {
+    headers: {
+      "Authorization": `Bearer ${accessToken}`
+    }
+  });
+  if (!resp.ok) {
+    throw new Error("Impossibile leggere userinfo");
+  }
+  const data = await resp.json();
+  return data.email || null;
+}
 
 // ======================
 // ENDPOINTS
@@ -66,7 +93,7 @@ let REFRESH_TOKEN = null;
 
 // test rapido base
 app.get("/", (_, res) => {
-  res.send("Mini API attiva e respirante.");
+  res.send("Mini API attiva e respirante (per-utente).");
 });
 
 // test Firestore
@@ -81,71 +108,14 @@ app.get("/firestore-test", async (_, res) => {
   }
 });
 
-// ======================
-// CALLBACK DA GOOGLE (GET)
-// Google ti rimanda QUI con ?code=...
-// ======================
-app.get("/oauth2/callback", async (req, res) => {
-  const { code } = req.query;
-  if (!code) {
-    return res.status(400).json({ error: "Missing code in query" });
-  }
-
-  try {
-    const googleResp = await fetch("https://oauth2.googleapis.com/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        code,
-        client_id: GOOGLE_CLIENT_ID,
-        client_secret: GOOGLE_CLIENT_SECRET,
-        redirect_uri: GOOGLE_REDIRECT_URI,
-        grant_type: "authorization_code"
-      })
-    });
-
-    const data = await googleResp.json();
-    if (data.error) {
-      return res.status(400).json(data);
-    }
-
-    // se Google ci dà il refresh, salviamo
-    if (data.refresh_token) {
-      REFRESH_TOKEN = data.refresh_token;
-      try {
-        await saveRefreshToFirestore(data.refresh_token);
-      } catch (err) {
-        console.error("Errore salvataggio refresh su Firestore:", err.message);
-      }
-    } else {
-      // se non lo dà, proviamo a ricaricarlo da Firestore
-      const fromFs = await loadRefreshFromFirestore();
-      if (fromFs) {
-        REFRESH_TOKEN = fromFs;
-      }
-    }
-
-    return res.json({
-      access_token: data.access_token,
-      expires_in: data.expires_in,
-      has_refresh: !!(data.refresh_token || REFRESH_TOKEN)
-    });
-  } catch (err) {
-    console.error("Exchange via GET failed:", err);
-    return res.status(500).json({ error: "Exchange failed", detail: err.message });
-  }
-});
-
-// ======================
-// CALLBACK DA GOOGLE (POST)
-// (se mai la useremo dal frontend)
-// ======================
+// Riceve il code da OAuth e lo scambia per token + refresh
+// e ***LO COLLEGA ALLA MAIL*** di chi ha fatto login
 app.post("/oauth2/callback", async (req, res) => {
   const { code } = req.body;
   if (!code) return res.status(400).json({ error: "Missing code" });
 
   try {
-    const googleResp = await fetch("https://oauth2.googleapis.com/token", {
+    const resp = await fetch("https://oauth2.googleapis.com/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
@@ -157,57 +127,73 @@ app.post("/oauth2/callback", async (req, res) => {
       })
     });
 
-    const data = await googleResp.json();
+    const data = await resp.json();
     if (data.error) {
       return res.status(400).json(data);
     }
 
-    if (data.refresh_token) {
-      REFRESH_TOKEN = data.refresh_token;
+    const accessToken  = data.access_token;
+    const refreshToken = data.refresh_token || null;
+
+    // ricaviamo la mail
+    let email = null;
+    try {
+      email = await fetchUserEmail(accessToken);
+    } catch (e) {
+      console.error("Errore lettura userinfo:", e.message);
+    }
+
+    // se non riesco a capire chi è, non posso salvarlo per-utente
+    if (!email) {
+      return res.status(400).json({
+        error: "no_email",
+        error_description: "Non sono riuscito a ricavare l'email dall'access token"
+      });
+    }
+
+    // se Google ci ha dato un refresh, lo salvo legato a QUELLA mail
+    if (refreshToken) {
       try {
-        await saveRefreshToFirestore(data.refresh_token);
+        await saveRefreshForUser(email, refreshToken);
       } catch (err) {
         console.error("Errore salvataggio refresh su Firestore:", err.message);
       }
     } else {
-      const fromFs = await loadRefreshFromFirestore();
-      if (fromFs) {
-        REFRESH_TOKEN = fromFs;
+      // se NON c'è refresh (utente aveva già dato il consenso in passato),
+      // provo a caricarne uno già esistente per lui
+      const old = await loadRefreshForUser(email);
+      if (old) {
+        RAM_REFRESH.set(email, old);
       }
     }
 
-    return res.json({
-      access_token: data.access_token,
+    res.json({
+      access_token: accessToken,
       expires_in: data.expires_in,
-      has_refresh: !!(data.refresh_token || REFRESH_TOKEN)
+      email,
+      has_refresh: !!(refreshToken || RAM_REFRESH.get(email))
     });
   } catch (err) {
-    console.error("Exchange via POST failed:", err);
-    return res.status(500).json({ error: "Exchange failed", detail: err.message });
+    console.error("Exchange failed:", err);
+    res.status(500).json({ error: "Exchange failed", detail: err.message });
   }
 });
 
-// ======================
-// REFRESH TOKEN (GET/POST)
-// ======================
-async function doRefresh(res) {
+// Rinnova il token usando il refresh salvato PER QUELLA MAIL
+app.post("/oauth2/refresh", async (req, res) => {
   try {
-    // 1) RAM
-    let refresh = REFRESH_TOKEN;
-
-    // 2) Firestore
-    if (!refresh) {
-      refresh = await loadRefreshFromFirestore();
-      if (refresh) {
-        REFRESH_TOKEN = refresh;
-      }
+    const email = req.body?.email || req.query?.email;
+    if (!email) {
+      return res.status(400).json({ error: "missing_email" });
     }
 
+    // cerco un refresh per quella mail
+    let refresh = await loadRefreshForUser(email);
     if (!refresh) {
-      return res.status(400).json({ error: "No refresh token yet" });
+      return res.status(404).json({ error: "no_refresh_for_user", email });
     }
 
-    const googleResp = await fetch("https://oauth2.googleapis.com/token", {
+    const resp = await fetch("https://oauth2.googleapis.com/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
@@ -218,37 +204,25 @@ async function doRefresh(res) {
       })
     });
 
-    const data = await googleResp.json();
+    const data = await resp.json();
     if (data.error) {
       return res.status(400).json(data);
     }
 
-    // raro, ma se Google ti dà di nuovo un refresh
+    // se Google ci dà un refresh nuovo, aggiorniamo (succede raramente)
     if (data.refresh_token) {
-      REFRESH_TOKEN = data.refresh_token;
-      try {
-        await saveRefreshToFirestore(data.refresh_token);
-      } catch (err) {
-        console.error("Errore aggiornamento refresh su Firestore:", err.message);
-      }
+      await saveRefreshForUser(email, data.refresh_token);
     }
 
-    return res.json({
+    res.json({
       access_token: data.access_token,
-      expires_in: data.expires_in
+      expires_in: data.expires_in,
+      email
     });
   } catch (err) {
     console.error("Refresh failed:", err);
-    return res.status(500).json({ error: "Refresh failed", detail: err.message });
+    res.status(500).json({ error: "Refresh failed", detail: err.message });
   }
-}
-
-app.get("/oauth2/refresh", async (req, res) => {
-  return doRefresh(res);
-});
-
-app.post("/oauth2/refresh", async (req, res) => {
-  return doRefresh(res);
 });
 
 // avvio server
