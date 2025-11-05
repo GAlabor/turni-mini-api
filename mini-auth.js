@@ -191,6 +191,13 @@ app.post("/oauth2/refresh", async (req, res) => {
   }
 });
 
+// ======================
+// PING KEEP-ALIVE
+// ======================
+app.get("/ping", (req, res) => {
+  res.status(200).send("pong");
+});
+
 // avvio server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Mini-API pronta su ${PORT}`));
